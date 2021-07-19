@@ -36,15 +36,6 @@ internal open class NettyNetworkHandler(
     context: NetworkHandlerContext,
     private val address: SocketAddress,
 ) : NetworkHandlerSupport(context) {
-    override fun close(cause: Throwable?) {
-        if (state == State.CLOSED) return // already
-        setState { StateClosed(CancellationException("Closed manually.", cause)) }
-        super.close(cause)
-        // wrap an exception, more stacktrace information
-    }
-
-    private fun closeSuper(cause: Throwable?) = super.close(cause)
-
     final override tailrec suspend fun sendPacketImpl(packet: OutgoingPacket) {
         val state = _state as NettyState
         if (state.sendPacketImpl(packet)) return
@@ -65,21 +56,16 @@ internal open class NettyNetworkHandler(
     protected open fun handleExceptionInDecoding(error: Throwable) {
         if (error is OicqDecodingException) {
             if (error.targetException is EOFException) return
-            throw error.targetException
         }
-        throw error
+
+        coroutineContext[CoroutineExceptionHandler]!!.handleException(
+            coroutineContext,
+            ExceptionInPacketCodecException(error.unwrap<OicqDecodingException>())
+        )
     }
 
     protected open fun handlePipelineException(ctx: ChannelHandlerContext, error: Throwable) {
-        context.bot.logger.error(error)
-        synchronized(this) {
-            setState { StateClosed(NettyChannelException(cause = error)) }
-            if (_state !is StateConnecting) {
-                setState { StateConnecting(ExceptionCollector(error)) }
-            } else {
-                close(error)
-            }
-        }
+        setState { StateClosed(NettyChannelException(cause = error)) }
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -102,7 +88,7 @@ internal open class NettyNetworkHandler(
     }
 
     private inner class RawIncomingPacketCollector(
-        private val decodePipeline: PacketDecodePipeline
+        private val decodePipeline: PacketDecodePipeline,
     ) : SimpleChannelInboundHandler<RawIncomingPacket>(RawIncomingPacket::class.java) {
         override fun channelRead0(ctx: ChannelHandlerContext, msg: RawIncomingPacket) {
             decodePipeline.send(msg)
@@ -111,7 +97,7 @@ internal open class NettyNetworkHandler(
 
     private inner class OutgoingPacketEncoder : MessageToByteEncoder<OutgoingPacket>(OutgoingPacket::class.java) {
         override fun encode(ctx: ChannelHandlerContext, msg: OutgoingPacket, out: ByteBuf) {
-            packetLogger.debug { "encode: $msg" }
+            packetLogger.debug { "encode: ${msg.displayName}" }
             out.writeBytes(msg.delegate)
         }
     }
@@ -146,13 +132,19 @@ internal open class NettyNetworkHandler(
                         .addLast(object : ChannelInboundHandlerAdapter() {
                             override fun channelInactive(ctx: ChannelHandlerContext?) {
                                 eventLoopGroup.shutdownGracefully()
+                                contextResult.cancel()
                             }
                         })
 
                 }
             })
             .connect(address)
-            .awaitKt()
+            .runCatching {
+                awaitKt()
+            }.onFailure {
+                eventLoopGroup.shutdownGracefully()
+                contextResult.cancel()
+            }.getOrThrow()
 
         contextResult.complete(future.channel())
 
@@ -163,7 +155,7 @@ internal open class NettyNetworkHandler(
 
         future.channel().closeFuture().addListener {
             if (_state.correspondingState == State.CLOSED) return@addListener
-            setState { StateClosed(it.cause()) }
+            close(it.cause())
         }
 
         return contextResult.await()
@@ -205,9 +197,15 @@ internal open class NettyNetworkHandler(
     // states
     ///////////////////////////////////////////////////////////////////////////
 
+    override fun close(cause: Throwable?) {
+        if (state == State.CLOSED) return // quick check if already closed
+        if (setState { StateClosed(cause) } == null) return // atomic check
+        super.close(cause) // cancel coroutine scope
+    }
+
     init {
         coroutineContext.job.invokeOnCompletion { e ->
-            setState { StateClosed(e?.unwrapCancellationException()) }
+            close(e?.unwrapCancellationException())
         }
     }
 
@@ -219,7 +217,7 @@ internal open class NettyNetworkHandler(
      * @see StateObserver
      */
     protected abstract inner class NettyState(
-        correspondingState: State
+        correspondingState: State,
     ) : BaseStateImpl(correspondingState) {
         /**
          * @return `true` if packet has been sent, `false` if state is not ready for send.
@@ -230,7 +228,7 @@ internal open class NettyNetworkHandler(
 
     protected inner class StateInitialized : NettyState(State.INITIALIZED) {
         override suspend fun sendPacketImpl(packet: OutgoingPacket): Boolean {
-//            error("Cannot send packet when connection is not set. (resumeConnection not called.)")
+            //            error("Cannot send packet when connection is not set. (resumeConnection not called.)")
             return false
         }
 
@@ -312,7 +310,7 @@ internal open class NettyNetworkHandler(
      * @see StateObserver
      */
     protected inner class StateLoading(
-        private val connection: NettyChannel
+        private val connection: NettyChannel,
     ) : NettyState(State.LOADING) {
         init {
             coroutineContext.job.invokeOnCompletion {
@@ -348,7 +346,12 @@ internal open class NettyNetworkHandler(
         private val configPush: Job,
     ) : NettyState(State.OK) {
         init {
-            coroutineContext.job.invokeOnCompletion {
+            coroutineContext.job.invokeOnCompletion { err ->
+                if (err is StateSwitchingException) {
+                    if (err.new.correspondingState == State.CLOSED) {
+                        return@invokeOnCompletion
+                    }
+                }
                 connection.close()
             }
         }
@@ -380,10 +383,10 @@ internal open class NettyNetworkHandler(
     }
 
     protected inner class StateClosed(
-        val exception: Throwable?
+        val exception: Throwable?,
     ) : NettyState(State.CLOSED) {
         init {
-            closeSuper(exception)
+            close(exception)
         }
 
         override fun getCause(): Throwable? = exception
@@ -396,12 +399,4 @@ internal open class NettyNetworkHandler(
     }
 
     override fun initialState(): BaseStateImpl = StateInitialized()
-
-    companion object {
-        /**
-         * millis
-         */
-        @JvmField
-        var RECONNECT_DELAY = systemProp("mirai.network.reconnect.delay", 5000)
-    }
 }

@@ -9,12 +9,12 @@
 
 package net.mamoe.mirai.internal.contact
 
-import net.mamoe.mirai.Bot
 import net.mamoe.mirai.Mirai
 import net.mamoe.mirai.contact.User
 import net.mamoe.mirai.data.UserInfo
 import net.mamoe.mirai.event.broadcast
 import net.mamoe.mirai.event.events.*
+import net.mamoe.mirai.internal.QQAndroidBot
 import net.mamoe.mirai.internal.message.OfflineFriendImage
 import net.mamoe.mirai.internal.message.contextualBugReportException
 import net.mamoe.mirai.internal.message.getImageType
@@ -40,7 +40,7 @@ import kotlin.coroutines.CoroutineContext
 internal val User.info: UserInfo? get() = this.castOrNull<AbstractUser>()?.info
 
 internal abstract class AbstractUser(
-    bot: Bot,
+    bot: QQAndroidBot,
     coroutineContext: CoroutineContext,
     userInfo: UserInfo,
 ) : User, AbstractContact(bot, coroutineContext) {
@@ -64,7 +64,8 @@ internal abstract class AbstractUser(
                     fileMd5 = resource.md5,
                     fileSize = resource.size,
                     fileName = resource.md5.toUHexString("") + "." + resource.formatName,
-                    imgOriginal = 1,
+                    imgOriginal = true,
+                    buildVer = bot.client.buildVer
                 )
             ).sendAndExpect<LongConn.OffPicUp.Response>()
         }

@@ -11,6 +11,7 @@ package net.mamoe.mirai.internal.network.components
 
 import kotlinx.io.core.*
 import net.mamoe.mirai.internal.QQAndroidBot
+import net.mamoe.mirai.internal.network.QQAndroidClient
 import net.mamoe.mirai.internal.network.component.ComponentKey
 import net.mamoe.mirai.internal.network.components.PacketCodec.Companion.PacketLogger
 import net.mamoe.mirai.internal.network.context.SsoSession
@@ -49,6 +50,10 @@ internal interface PacketCodec {
         }
     }
 }
+
+internal data class ExceptionInPacketCodecException(
+    override val cause: Throwable,
+) : IllegalStateException("Exception in PacketCodec.", cause)
 
 internal class OicqDecodingException(
     val targetException: Throwable
@@ -200,25 +205,29 @@ internal class PacketCodecImpl : PacketCodec {
         val encryptionMethod = this.readUShort().toInt()
 
         this.discardExact(1)
+        val ecdhWithPublicKey =
+            (client as QQAndroidClient).bot.components[EcdhInitialPublicKeyUpdater].getECDHWithPublicKey()
         return when (encryptionMethod) {
             4 -> {
+                val size = (this.remaining - 1).toInt()
                 val data =
                     TEA.decrypt(
                         this.readBytes(),
-                        client.ecdh.keyPair.initialShareKey,
-                        length = (this.remaining - 1).toInt()
+                        ecdhWithPublicKey.keyPair.maskedShareKey,
+                        length = size
                     )
 
                 val peerShareKey =
-                    client.ecdh.calculateShareKeyByPeerPublicKey(readUShortLVByteArray().adjustToPublicKey())
+                    ecdhWithPublicKey.calculateShareKeyByPeerPublicKey(readUShortLVByteArray().adjustToPublicKey())
                 TEA.decrypt(data, peerShareKey)
             }
             3 -> {
+                val size = (this.remaining - 1).toInt();
                 // session
                 TEA.decrypt(
                     this.readBytes(),
                     client.wLoginSigInfo.wtSessionTicketKey,
-                    length = (this.remaining - 1).toInt()
+                    length = size
                 )
             }
             0 -> {
@@ -227,12 +236,13 @@ internal class PacketCodecImpl : PacketCodec {
                     val byteArrayBuffer = this.readBytes(size)
 
                     runCatching {
-                        TEA.decrypt(byteArrayBuffer, client.ecdh.keyPair.initialShareKey, length = size)
+                        TEA.decrypt(byteArrayBuffer, ecdhWithPublicKey.keyPair.maskedShareKey, length = size)
                     }.getOrElse {
                         TEA.decrypt(byteArrayBuffer, client.randomKey, length = size)
                     }
                 } else {
-                    TEA.decrypt(this.readBytes(), client.randomKey, length = (this.remaining - 1).toInt())
+                    val size = (this.remaining - 1).toInt()
+                    TEA.decrypt(this.readBytes(), client.randomKey, length = size)
                 }
             }
             else -> error("Illegal encryption method. expected 0 or 4, got $encryptionMethod")
@@ -256,10 +266,10 @@ internal class PacketCodecImpl : PacketCodec {
             }
         }.fold(
             onSuccess = { packet ->
-                IncomingPacket(input.commandName, input.sequenceId, packet, null)
+                IncomingPacket(input.commandName, input.sequenceId, packet)
             },
             onFailure = { exception: Throwable ->
-                IncomingPacket(input.commandName, input.sequenceId, null, exception)
+                IncomingPacket(input.commandName, input.sequenceId, exception)
             }
         )
     }
